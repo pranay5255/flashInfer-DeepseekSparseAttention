@@ -1,6 +1,6 @@
 [solution]
-name = "dsa-topk-indexer-reference"
-definition = "dsa_topk_indexer_fp8_h64_d128_topk256_ps64"
+name = "gemm-triton-v1"
+definition = "gemm_n4096_k4096"
 author = "team-name"
 
 [build]

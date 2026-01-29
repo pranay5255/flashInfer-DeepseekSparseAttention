@@ -1,11 +1,8 @@
 """
-DSA TopK Indexer Reference Implementation for FlashInfer Competition.
+GEMM Triton Kernel for FlashInfer Competition.
 
-Native Sparse Attention (DSA) TopK indexer with FP8 quantization for DeepSeek-V3.
-Computes sparse attention scores using ReLU activation and learned weights,
-then selects top-K KV cache indices.
-
-Kernel: dsa_topk_indexer_fp8_h64_d128_topk256_ps64
+Implements C = A @ B.T for gemm_n4096_k4096 definition.
+Captured from Llama 3.1 8B attention output projection.
 """
 
 import torch
@@ -13,72 +10,122 @@ import triton
 import triton.language as tl
 
 
-def dequant_fp8_kv_cache(k_index_cache_fp8):
-    """Dequantize FP8 KV cache from deep_gemm format."""
-    k_index_cache_fp8 = k_index_cache_fp8.view(torch.uint8)
-    num_pages, page_size, num_heads, head_dim_sf = k_index_cache_fp8.shape
-    head_dim = head_dim_sf - 4  # 128
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=5, num_warps=2),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bn, stride_bk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """
+    Compute C = A @ B.T
 
-    kv_flat = k_index_cache_fp8.view(num_pages, page_size * head_dim_sf)
-    fp8_bytes = kv_flat[:, :page_size * head_dim].contiguous()
-    fp8_tensor = fp8_bytes.view(num_pages, page_size, head_dim).view(torch.float8_e4m3fn)
-    fp8_float = fp8_tensor.to(torch.float32)
+    A: [M, K], B: [N, K] -> C: [M, N]
+    Note: B is stored as [N, K] but we compute A @ B.T
+    """
+    pid = tl.program_id(0)
 
-    scale_bytes = kv_flat[:, page_size * head_dim:].contiguous()
-    scale = scale_bytes.view(num_pages, page_size, 4).view(torch.float32)
+    # Swizzle for better L2 cache locality
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
-    return fp8_float * scale
+    # Block start indices
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to first block of A and B
+    # A: [M, K] with strides (stride_am, stride_ak)
+    # B: [N, K] with strides (stride_bn, stride_bk) - we read rows of B
+    a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B_ptr + offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main loop over K dimension
+    for k in range(0, K, BLOCK_K):
+        # Load A block [BLOCK_M, BLOCK_K]
+        a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # Load B block [BLOCK_N, BLOCK_K]
+        b_mask = (offs_n[:, None] < N) & ((k + offs_k[None, :]) < K)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Compute A @ B.T -> need to transpose b
+        # a: [BLOCK_M, BLOCK_K], b: [BLOCK_N, BLOCK_K]
+        # We want: a @ b.T = [BLOCK_M, BLOCK_N]
+        acc += tl.dot(a, tl.trans(b))
+
+        # Advance pointers
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Convert to output dtype and store
+    c = acc.to(tl.float16)
+
+    # Store result
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 @torch.no_grad()
-def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
+def run(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
-    DSA TopK Indexer kernel entry point.
+    GEMM kernel entry point: C = A @ B.T
 
     Args:
-        q_index_fp8: Query index tensor [batch_size, num_index_heads=64, index_head_dim=128], float8_e4m3fn
-        k_index_cache_fp8: KV cache [num_pages, page_size=64, kv_cache_num_heads=1, head_dim_with_scale=132], int8
-        weights: Learned weights [batch_size, num_index_heads=64], float32
-        seq_lens: Sequence lengths [batch_size], int32
-        block_table: Page table [batch_size, max_num_pages], int32
+        A: Input matrix [M, K], float16
+        B: Weight matrix [N, K], float16
 
     Returns:
-        topk_indices: Selected top-K indices [batch_size, topk=256], int32
+        C: Output matrix [M, N], float16
     """
-    batch_size, num_index_heads, index_head_dim = q_index_fp8.shape
-    num_pages, page_size, _, _ = k_index_cache_fp8.shape
-    topk = 256
+    assert A.is_cuda and B.is_cuda, "Inputs must be on CUDA"
+    assert A.dtype == torch.float16 and B.dtype == torch.float16, "Inputs must be float16"
 
-    q = q_index_fp8.to(torch.float32)
-    K_all = dequant_fp8_kv_cache(k_index_cache_fp8)
+    M, K = A.shape
+    N, K_b = B.shape
+    assert K == K_b, f"K dimension mismatch: A has {K}, B has {K_b}"
 
-    topk_indices = torch.full((batch_size, topk), -1, dtype=torch.int32, device=q.device)
+    # Allocate output
+    C = torch.empty((M, N), device=A.device, dtype=torch.float16)
 
-    for b in range(batch_size):
-        seq_len = int(seq_lens[b].item())
-        if seq_len == 0:
-            continue
+    # Grid: one program per output tile
+    def grid(META):
+        return (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
 
-        num_pages_for_seq = (seq_len + page_size - 1) // page_size
-        page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
-        K_paged = K_all[page_indices]
-        K = K_paged.reshape(-1, index_head_dim)[:seq_len]
+    # Launch kernel
+    matmul_kernel[grid](
+        A, B, C,
+        M, N, K,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+    )
 
-        q_b = q[b]
-        scores = q_b @ K.T
-        scores_relu = torch.relu(scores)
-        w = weights[b]
-        weighted_scores = scores_relu * w[:, None]
-        final_scores = weighted_scores.sum(dim=0)
-
-        actual_topk = min(topk, seq_len)
-        _, topk_idx = torch.topk(final_scores, actual_topk)
-
-        page_idx_per_token = topk_idx // page_size
-        offset_per_token = topk_idx % page_size
-        global_page_idx = page_indices[page_idx_per_token]
-        topk_tokens = global_page_idx * page_size + offset_per_token
-
-        topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
-
-    return (topk_indices,)
+    return C
